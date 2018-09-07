@@ -25,7 +25,7 @@ func TestNewFileFromReader(t *testing.T) {
 }
 
 func TestReadElement(t *testing.T) {
-	qm7, err := os.Open("testdata/qm7.mat")
+	qm7, err := os.Open("testdata/varTypes.mat")
 	if err != nil {
 		t.Fatal(err.Error())
 	}

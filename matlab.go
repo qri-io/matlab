@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"strings"
@@ -197,6 +196,11 @@ func readAllBytes(p int, rdr io.Reader) (buf []byte, err error) {
 		n, err = rdr.Read(r)
 
 		if err != nil {
+			if err.Error() == "EOF" {
+				if p-n == 0 {
+					return append(buf, r[:n]...), nil
+				}
+			}
 			return
 		}
 
@@ -216,36 +220,19 @@ func (f *File) readUint32() (uint32, error) {
 
 // ReadElement reads a single Element from a file's reader
 func (f *File) ReadElement() (el *Element, err error) {
-	return readElement(f.r, f.Header.Endianess)
+	return readElement(f.Header.Endianess, f.r)
 }
 
-func readElement(r io.Reader, bo binary.ByteOrder) (el *Element, err error) {
-	buf, err := readAllBytes(4, r)
-	if err != nil {
-		return nil, err
-	}
+func readElement(bo binary.ByteOrder, r io.Reader) (el *Element, err error) {
+	var p int
+	el, p, err = readTag(bo, r)
 
-	// handle small type
-	if buf[0] != 0 && buf[1] != 0 {
-		el = &Element{Type: DataType(bo.Uint16(buf[1:]))}
-		if _, err = r.Read(buf); err != nil {
-			return
-		}
-		fmt.Println("SMOL", el.Type.String(), hex.EncodeToString(buf))
-		el.Value, err = parse(el.Type, bo, buf)
+	// if small element, p will be 0, bail early
+	if p == 0 {
 		return
 	}
 
-	el = &Element{Type: DataType(bo.Uint32(buf))}
-	// read number of bytes, we know buf is 4 bytes long so this works
-	if _, err = r.Read(buf); err != nil {
-		return nil, err
-	}
-	p := bo.Uint32(buf)
-
-	// TODO - remove
-	fmt.Println(el.Type.String(), p)
-
+	var buf []byte
 	if el.Type != DTmiCOMPRESSED {
 		// read data
 		if buf, err = readAllBytes(int(p), r); err != nil {
@@ -257,22 +244,40 @@ func readElement(r io.Reader, bo binary.ByteOrder) (el *Element, err error) {
 		if err != nil {
 			return nil, err
 		}
-		if buf, err = readAllBytes(int(p), cr); err != nil {
-			return nil, err
-		}
-		if err = cr.Close(); err != nil {
-			return nil, err
-		}
+		defer cr.Close()
 
-		return readElement(bytes.NewBuffer(buf), bo)
+		return readElement(bo, cr)
 	}
 
 	el.Value, err = parse(el.Type, bo, buf)
 	return
 }
 
+func readTag(bo binary.ByteOrder, r io.Reader) (el *Element, len int, err error) {
+	var buf []byte
+	if buf, err = readAllBytes(8, r); err != nil {
+		return
+	}
+
+	// handle small type
+	if buf[0] != 0 && buf[1] != 0 {
+		len = int(bo.Uint16(buf[:2]))
+		el = &Element{Type: DataType(bo.Uint16(buf[1:3]))}
+		fmt.Println("SMOL: ", el.Type.String(), len, buf)
+		el.Value, err = parse(el.Type, bo, buf[3:])
+		return
+	}
+
+	el = &Element{Type: DataType(bo.Uint32(buf[:4]))}
+	len = int(bo.Uint32(buf[4:]))
+	fmt.Println("read tag", el.Type.String(), len, buf)
+	return
+}
+
 func parse(t DataType, bo binary.ByteOrder, data []byte) (interface{}, error) {
 	switch t {
+	case DTmiINT8:
+		return int(data[0]), nil
 	case DTmiMATRIX:
 		return miMatrix(bo, data)
 	case DTmiUINT32:
@@ -284,18 +289,172 @@ func parse(t DataType, bo binary.ByteOrder, data []byte) (interface{}, error) {
 	}
 }
 
-func miMatrix(bo binary.ByteOrder, data []byte) (interface{}, error) {
-	buf := bytes.NewBuffer(data)
-	var els []interface{}
-	for {
-		el, err := readElement(buf, bo)
-		if err != nil {
+func miMatrix(bo binary.ByteOrder, data []byte) (val interface{}, err error) {
+	r := bytes.NewBuffer(data)
+
+	complex, class, err := arrayFlags(bo, r)
+	if err != nil {
+		return
+	}
+	fmt.Println(complex, class.String())
+
+	dim, err := dimensionsArray(bo, r)
+	if err != nil {
+		return
+	}
+
+	name, err := arrayName(bo, r)
+	if err != nil {
+		return
+	}
+	fmt.Println(name, dim)
+	return nil, fmt.Errorf("not finished")
+
+	// var els []interface{}
+	// for {
+	// 	el, err := readElement(bo, r)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	els = append(els, el)
+	// }
+	// return nil, fmt.Errorf("cannot parse miMatrix")
+}
+
+func arrayFlags(bo binary.ByteOrder, r io.Reader) (complex bool, class mxClass, err error) {
+	fmt.Println("read array flags")
+	el, p, err := readTag(bo, r)
+	if el.Type != DTmiUINT32 {
+		err = fmt.Errorf("invalid matrix")
+		return
+	}
+
+	buf := make([]byte, p)
+	// // read array flags
+	if _, err = r.Read(buf); err != nil {
+		return
+	}
+	// flags := (buf[0] &&& 0xff00) >>> 8 |> byte
+	// complex, glbl, logical := flags &&& 8, flags &&& 4, flags &&& 2
+	// fmt.Println(p, hex.EncodeToString(buf))
+	// TODO -
+	// complex = 8 & f[2]
+	// fmt.Println(hex.EncodeToString(buf), uint8(buf[3]))
+	fmt.Println(buf, buf[0]&0x00ff)
+	class = mxClass(buf[0] & 0x00ff)
+	return
+}
+
+func dimensionsArray(bo binary.ByteOrder, r io.Reader) ([]int32, error) {
+	fmt.Println("dimensions array")
+	el, p, err := readTag(bo, r)
+	if err != nil {
+		return nil, err
+	}
+	if el.Type != DTmiINT32 {
+		return nil, fmt.Errorf("invalid data type")
+	}
+
+	// fmt.Println("NO MOAR TAGS", el.Type.String(), p)
+	buf := make([]byte, p)
+	if _, err := r.Read(buf); err != nil {
+		return nil, err
+	}
+
+	dimsr := bytes.NewBuffer(buf)
+	sBuf := make([]byte, 4)
+	dim := make([]int32, p/4)
+	for i := 0; i < p/4; i++ {
+		if _, err := dimsr.Read(sBuf); err != nil {
 			return nil, err
 		}
-		els = append(els, el)
+		dim[i] = int32(bo.Uint32(sBuf))
 	}
-	return nil, fmt.Errorf("cannot parse miMatrix")
+	fmt.Println(dim)
+	return dim, nil
 }
+
+func arrayName(bo binary.ByteOrder, r io.Reader) (string, error) {
+	fmt.Println("array name")
+	_, p, err := readTag(bo, r)
+	if err != nil {
+		return "", err
+	}
+
+	// if el.Type != DTmiINT8 {
+	// 	return "", fmt.Errorf("invalid data type")
+	// }
+	// dimsr := bytes.NewBuffer(buf)
+	// sBuf := make([]byte, 4)
+	// dim := make([]byte, p/4)
+	// for i := 0; i < p/4; i++ {
+	// 	if _, err := dimsr.Read(sBuf); err != nil {
+	// 		return nil, err
+	// 	}
+	// 	dim[i] = int32(bo.Uint32(sBuf))
+	// }
+	data, err := readAllBytes(p, r)
+	return string(data), err
+}
+
+type mxClass uint8
+
+func (c mxClass) String() string {
+	switch c {
+	case mxCELL:
+		return "Cell array"
+	case mxSTRUCT:
+		return "Structure"
+	case mxOBJECT:
+		return "Object"
+	case mxCHAR:
+		return "Character array"
+	case mxSPARSE:
+		return "Sparse array"
+	case mxDOUBLE:
+		return "Double precision array"
+	case mxSINGLE:
+		return "Single precision array"
+	case mxINT8:
+		return "8-bit, signed integer"
+	case mxUINT8:
+		return "8-bit, unsigned integer"
+	case mxINT16:
+		return "16-bit, signed integer"
+	case mxUINT16:
+		return "16-bit, unsigned integer"
+	case mxINT32:
+		return "32-bit, signed integer"
+	case mxUINT32:
+		return "32-bit, unsigned integer"
+	case mxINT64:
+		return "64-bit, signed integer"
+	case mxUINT64:
+		return "64-bit, unsigned integer"
+	default:
+		return "unknown"
+	}
+}
+
+// MATLAB Array Types (Classes)
+const (
+	mxUNKNOWN mxClass = iota
+	mxCELL            // Cell array
+	mxSTRUCT          // Structure
+	mxOBJECT          // Object
+	mxCHAR            // Character array
+	mxSPARSE          // Sparse array *NB: don't use*
+	mxDOUBLE          // Double precision array
+	mxSINGLE          // Single precision array
+	mxINT8            // 8-bit, signed integer
+	mxUINT8           // 8-bit, unsigned integer
+	mxINT16           // 16-bit, signed integer
+	mxUINT16          // 16-bit, unsigned integer
+	mxINT32           // 32-bit, signed integer
+	mxUINT32          // 32-bit, unsigned integer
+	mxINT64           // 64-bit, signed integer
+	mxUINT64          // 64-bit, unsigned integer
+)
 
 func writeHeader(w io.Writer, h *Header) error {
 	return fmt.Errorf("not finished")
